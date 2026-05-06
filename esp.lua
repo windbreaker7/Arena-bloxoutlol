@@ -65,6 +65,27 @@ local refreshCallbacks = {}
 local localAmmoHUD = nil
 local currentTool = nil
 
+-- Cached character parts for performance
+local cachedRoot = nil
+local function getCachedRoot()
+    local character = LocalPlayer.Character
+    if not character then cachedRoot = nil; return nil end
+    if cachedRoot and cachedRoot.Parent == character then return cachedRoot end
+    cachedRoot = character:FindFirstChild("HumanoidRootPart")
+    return cachedRoot
+end
+
+-- ==========================================
+-- AMMO FORMATTING (Chambered is BoolValue)
+-- ==========================================
+local function formatMag(mag, chambered)
+    local magVal = type(mag) == "number" and mag or 0
+    if chambered then
+        return tostring(magVal) .. "+1"
+    end
+    return tostring(magVal)
+end
+
 local function applyPreset(index)
     local preset = PRESETS[index]
     SETTINGS.MIN_VALUE = preset.MIN_VALUE
@@ -94,8 +115,7 @@ local function cyclePreset()
 end
 
 local function dumpLoot()
-    local character = LocalPlayer.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local root = getCachedRoot()
     if not root then return end
 
     local lootables = workspace:FindFirstChild("Lootables")
@@ -129,8 +149,7 @@ local function dumpLoot()
 end
 
 local function getDistance(part)
-    local character = LocalPlayer.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local root = getCachedRoot()
     if not root or not part then return math.huge end
     return math.floor((root.Position - part.Position).Magnitude)
 end
@@ -204,7 +223,10 @@ local function createESP(anchor, text, color)
     return bgui
 end
 
+-- Throttled distance update: only update every 0.1s per tag
+local lastDistUpdate = {}
 RunService.Heartbeat:Connect(function()
+    local now = tick()
     for anchor, tag in pairs(espTags) do
         if not tag or not tag.Parent then
             espTags[anchor] = nil
@@ -215,8 +237,12 @@ RunService.Heartbeat:Connect(function()
             if distLabel then
                 distLabel.Visible = SETTINGS.SHOW_DISTANCE
                 if SETTINGS.SHOW_DISTANCE then
-                    local dist = getDistance(anchor)
-                    distLabel.Text = dist == math.huge and "? studs" or (dist .. " studs")
+                    local last = lastDistUpdate[anchor] or 0
+                    if now - last >= 0.1 then
+                        lastDistUpdate[anchor] = now
+                        local dist = getDistance(anchor)
+                        distLabel.Text = dist == math.huge and "? studs" or (dist .. " studs")
+                    end
                 end
             end
         end
@@ -261,6 +287,7 @@ local function setupGenericContainer(model)
 
         local espTag = nil
         local lootFolder = model:WaitForChild("Loot", 5)
+        local connections = {}
 
         local function refresh()
             local content, hasElite = generateFilteredList(model)
@@ -287,23 +314,37 @@ local function setupGenericContainer(model)
 
         if lootFolder then
             refresh()
-            lootFolder.ChildAdded:Connect(refresh)
-            lootFolder.ChildRemoved:Connect(refresh)
+            table.insert(connections, lootFolder.ChildAdded:Connect(function(item)
+                refresh()
+                local moneyVal = item:FindFirstChild("MoneyValue")
+                if moneyVal then
+                    table.insert(connections, moneyVal.Changed:Connect(refresh))
+                end
+            end))
+            table.insert(connections, lootFolder.ChildRemoved:Connect(refresh))
             for _, item in ipairs(lootFolder:GetChildren()) do
                 local moneyVal = item:FindFirstChild("MoneyValue")
-                if moneyVal then moneyVal.Changed:Connect(refresh) end
+                if moneyVal then
+                    table.insert(connections, moneyVal.Changed:Connect(refresh))
+                end
             end
-            lootFolder.ChildAdded:Connect(function(item)
-                local moneyVal = item:FindFirstChild("MoneyValue")
-                if moneyVal then moneyVal.Changed:Connect(refresh) end
-            end)
         end
+
+        -- Clean up connections when the model is removed
+        anchor.AncestryChanged:Connect(function()
+            if not anchor:IsDescendantOf(game) then
+                for _, c in ipairs(connections) do c:Disconnect() end
+                table.clear(connections)
+                lastDistUpdate[anchor] = nil
+            end
+        end)
     end)
 end
 
+local extractionTags = {} -- track extraction zone ESPs separately
+
 local function setupExtraction(zone)
     if not zone:IsA("BasePart") then return end
-    if not SETTINGS.SHOW_EXTRACTION then return end
     task.spawn(function()
         local n = zone:WaitForChild("extractname", 5)
         local t = zone:WaitForChild("ExtractTime", 5)
@@ -313,7 +354,12 @@ local function setupExtraction(zone)
                 (t and tostring(t.Value) or "")
             )
         end
-        createESP(zone, buildText(), SETTINGS.ExtractionColor)
+
+        if SETTINGS.SHOW_EXTRACTION then
+            createESP(zone, buildText(), SETTINGS.ExtractionColor)
+        end
+        extractionTags[zone] = { buildText = buildText }
+
         if t then
             t.Changed:Connect(function()
                 local tag = espTags[zone]
@@ -382,22 +428,23 @@ local function updateEnemyAmmo(player, tool)
     if not label then return end
 
     if not tool then
-        label.Text = "0 / 0  [0]"
+        label.Text = "0 | 0"
         label.TextColor3 = Color3.fromRGB(255, 255, 255)
         return
     end
 
-    local repValues = tool:FindFirstChild("RepValues")
+    local repValues   = tool:FindFirstChild("RepValues")
     local magAmmo     = repValues and repValues:FindFirstChild("Mag")
     local reserveAmmo = repValues and repValues:FindFirstChild("StoredAmmo")
     local chambered   = repValues and repValues:FindFirstChild("Chambered")
 
-    local current = magAmmo and magAmmo.Value or "?"
-    local reserve  = reserveAmmo and reserveAmmo.Value or "?"
-    local chamber  = chambered and chambered.Value or "?"
+    local magVal     = magAmmo and magAmmo.Value or 0
+    local reserveVal = reserveAmmo and reserveAmmo.Value or "?"
+    local isChambered = chambered and chambered.Value or false
 
-    label.Text = string.format("%s  %s | %s  [%s]", tool.Name, tostring(chamber), tostring(current), tostring(reserve))
-    label.TextColor3 = getAmmoColor(current, magAmmo and magAmmo.Value or 0)
+    local magStr = formatMag(magVal, isChambered)
+    label.Text = string.format("%s  %s | %s", tool.Name, magStr, tostring(reserveVal))
+    label.TextColor3 = getAmmoColor(magVal, magVal) -- color based on mag fullness; replace second arg with MaxMag if available
 end
 
 local function createEnemyAmmoTag(player, character)
@@ -421,7 +468,7 @@ local function createEnemyAmmoTag(player, character)
     label.Parent = bgui
     label.BackgroundTransparency = 1
     label.Size = UDim2.new(1, 0, 1, 0)
-    label.Text = "0 / 0  [0]"
+    label.Text = "0 | 0"
     label.TextColor3 = Color3.fromRGB(255, 255, 255)
     label.TextStrokeTransparency = 0.5
     label.TextSize = 14
@@ -438,13 +485,13 @@ local function hookEnemyAmmoValues(player, tool)
     local repValues = tool:FindFirstChild("RepValues")
     if not repValues then return end
 
-    local ammo    = repValues:FindFirstChild("Mag")
-    local reserve = repValues:FindFirstChild("StoredAmmo")
-    local chamber = repValues:FindFirstChild("Chambered")
+    local ammo     = repValues:FindFirstChild("Mag")
+    local reserve  = repValues:FindFirstChild("StoredAmmo")
+    local chambered = repValues:FindFirstChild("Chambered")
 
-    if ammo    then ammo.Changed:Connect(function() updateEnemyAmmo(player, tool) end) end
-    if reserve then reserve.Changed:Connect(function() updateEnemyAmmo(player, tool) end) end
-    if chamber then chamber.Changed:Connect(function() updateEnemyAmmo(player, tool) end) end
+    if ammo     then ammo.Changed:Connect(function() updateEnemyAmmo(player, tool) end) end
+    if reserve  then reserve.Changed:Connect(function() updateEnemyAmmo(player, tool) end) end
+    if chambered then chambered.Changed:Connect(function() updateEnemyAmmo(player, tool) end) end
 end
 
 local function setupPlayerTools(player)
@@ -491,7 +538,13 @@ end
 -- ==========================================
 -- LOCAL AMMO HUD (upper right corner)
 -- ==========================================
+local localAmmoConnections = {}
+
 local function removeLocalAmmoHUD()
+    -- Disconnect old ammo value listeners to avoid leaks
+    for _, c in ipairs(localAmmoConnections) do c:Disconnect() end
+    table.clear(localAmmoConnections)
+
     if localAmmoHUD and localAmmoHUD.Parent then
         localAmmoHUD:Destroy()
         localAmmoHUD = nil
@@ -510,7 +563,7 @@ local function createLocalAmmoHUD()
     local frame = Instance.new("Frame")
     frame.Name = "AmmoFrame"
     frame.Size = UDim2.new(0, 220, 0, 50)
-    frame.Position = UDim2.new(1, -230, 0, 10) -- upper right
+    frame.Position = UDim2.new(1, -230, 0, 10)
     frame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
     frame.BackgroundTransparency = 0.3
     frame.BorderSizePixel = 0
@@ -537,7 +590,7 @@ local function createLocalAmmoHUD()
     ammoCount.Size = UDim2.new(1, -10, 0.45, 0)
     ammoCount.Position = UDim2.new(0, 10, 0.5, 0)
     ammoCount.BackgroundTransparency = 1
-    ammoCount.Text = "0 | 0  [0]"
+    ammoCount.Text = "0 | 0"
     ammoCount.TextColor3 = Color3.fromRGB(255, 255, 255)
     ammoCount.TextSize = 15
     ammoCount.Font = Enum.Font.GothamBold
@@ -562,7 +615,7 @@ local function updateLocalAmmoDisplay(tool)
     if not tool then
         gunLabel.Text = "No Weapon"
         gunLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-        ammoLabel.Text = "0 | 0  [0]"
+        ammoLabel.Text = "0 | 0"
         ammoLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
         return
     end
@@ -572,27 +625,33 @@ local function updateLocalAmmoDisplay(tool)
     local reserveAmmo = repValues and repValues:FindFirstChild("StoredAmmo")
     local chambered   = repValues and repValues:FindFirstChild("Chambered")
 
-    local current = magAmmo and magAmmo.Value or "?"
-    local reserve  = reserveAmmo and reserveAmmo.Value or "?"
-    local chamber  = chambered and chambered.Value or "?"
+    local magVal      = magAmmo and magAmmo.Value or 0
+    local reserveVal  = reserveAmmo and reserveAmmo.Value or "?"
+    local isChambered = chambered and chambered.Value or false
+
+    local magStr = formatMag(magVal, isChambered)
 
     gunLabel.Text = tool.Name
     gunLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    ammoLabel.Text = string.format("%s | %s  [%s]", tostring(chamber), tostring(current), tostring(reserve))
-    ammoLabel.TextColor3 = getAmmoColor(current, magAmmo and magAmmo.Value or 0)
+    ammoLabel.Text = string.format("%s | %s", magStr, tostring(reserveVal))
+    ammoLabel.TextColor3 = getAmmoColor(magVal, magVal) -- replace second arg with MaxMag if available
 end
 
 local function hookLocalAmmoValues(tool)
+    -- Clear previous connections before hooking new tool
+    for _, c in ipairs(localAmmoConnections) do c:Disconnect() end
+    table.clear(localAmmoConnections)
+
     local repValues = tool:FindFirstChild("RepValues")
     if not repValues then return end
 
-    local ammo    = repValues:FindFirstChild("Mag")
-    local reserve = repValues:FindFirstChild("StoredAmmo")
-    local chamber = repValues:FindFirstChild("Chambered")
+    local ammo     = repValues:FindFirstChild("Mag")
+    local reserve  = repValues:FindFirstChild("StoredAmmo")
+    local chambered = repValues:FindFirstChild("Chambered")
 
-    if ammo    then ammo.Changed:Connect(function() updateLocalAmmoDisplay(tool) end) end
-    if reserve then reserve.Changed:Connect(function() updateLocalAmmoDisplay(tool) end) end
-    if chamber then chamber.Changed:Connect(function() updateLocalAmmoDisplay(tool) end) end
+    if ammo     then table.insert(localAmmoConnections, ammo.Changed:Connect(function() updateLocalAmmoDisplay(tool) end)) end
+    if reserve  then table.insert(localAmmoConnections, reserve.Changed:Connect(function() updateLocalAmmoDisplay(tool) end)) end
+    if chambered then table.insert(localAmmoConnections, chambered.Changed:Connect(function() updateLocalAmmoDisplay(tool) end)) end
 end
 
 local function onToolEquipped(tool)
@@ -604,6 +663,9 @@ end
 
 local function onToolUnequipped()
     currentTool = nil
+    -- Clear ammo listeners since no tool is held
+    for _, c in ipairs(localAmmoConnections) do c:Disconnect() end
+    table.clear(localAmmoConnections)
     updateLocalAmmoDisplay(nil)
 end
 
@@ -632,7 +694,7 @@ end
 -- ==========================================
 -- SETTINGS HOT-SWAP
 -- ==========================================
-onSettingChanged(function(key, _)
+onSettingChanged(function(key, _value)
     local lootKeys = {
         MIN_VALUE = true, LootColor = true, HighValueColor = true,
         HIGH_VALUE_THRESHOLD = true, SHOW_RARITY = true, SHOW_TOTAL = true
@@ -676,6 +738,19 @@ onSettingChanged(function(key, _)
             end
         end
     end
+    if key == "SHOW_EXTRACTION" then
+        -- Toggle existing extraction zone ESPs
+        for zone, data in pairs(extractionTags) do
+            if _raw[key] then
+                if not espTags[zone] or not espTags[zone].Parent then
+                    createESP(zone, data.buildText(), SETTINGS.ExtractionColor)
+                end
+            else
+                local tag = espTags[zone]
+                if tag and tag.Parent then tag.Enabled = false end
+            end
+        end
+    end
 end)
 
 -- ==========================================
@@ -699,53 +774,33 @@ else
     screenGui.IgnoreGuiInset = true
     screenGui.Parent = TargetContainer
 
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 210, 0, 45)
-    frame.Position = UDim2.new(0, 10, 1, -60)
-    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-    frame.BackgroundTransparency = 0.3
-    frame.BorderSizePixel = 0
-    frame.Parent = screenGui
+    local function makePanel(parent, yOffset)
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(0, 210, 0, 45)
+        frame.Position = UDim2.new(0, 10, 1, yOffset)
+        frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+        frame.BackgroundTransparency = 0.3
+        frame.BorderSizePixel = 0
+        frame.Parent = parent
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = frame
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = frame
 
-    local layout = Instance.new("UIListLayout")
-    layout.FillDirection = Enum.FillDirection.Horizontal
-    layout.Padding = UDim.new(0, 5)
-    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    layout.VerticalAlignment = Enum.VerticalAlignment.Center
-    layout.Parent = frame
+        local layout = Instance.new("UIListLayout")
+        layout.FillDirection = Enum.FillDirection.Horizontal
+        layout.Padding = UDim.new(0, 5)
+        layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        layout.VerticalAlignment = Enum.VerticalAlignment.Center
+        layout.Parent = frame
 
-    local padding = Instance.new("UIPadding")
-    padding.PaddingLeft = UDim.new(0, 5)
-    padding.PaddingRight = UDim.new(0, 5)
-    padding.Parent = frame
+        local padding = Instance.new("UIPadding")
+        padding.PaddingLeft = UDim.new(0, 5)
+        padding.PaddingRight = UDim.new(0, 5)
+        padding.Parent = frame
 
-    local toggleFrame = Instance.new("Frame")
-    toggleFrame.Size = UDim2.new(0, 210, 0, 45)
-    toggleFrame.Position = UDim2.new(0, 10, 1, -110)
-    toggleFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-    toggleFrame.BackgroundTransparency = 0.3
-    toggleFrame.BorderSizePixel = 0
-    toggleFrame.Parent = screenGui
-
-    local toggleCorner = Instance.new("UICorner")
-    toggleCorner.CornerRadius = UDim.new(0, 8)
-    toggleCorner.Parent = toggleFrame
-
-    local toggleLayout = Instance.new("UIListLayout")
-    toggleLayout.FillDirection = Enum.FillDirection.Horizontal
-    toggleLayout.Padding = UDim.new(0, 5)
-    toggleLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    toggleLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-    toggleLayout.Parent = toggleFrame
-
-    local togglePadding = Instance.new("UIPadding")
-    togglePadding.PaddingLeft = UDim.new(0, 5)
-    togglePadding.PaddingRight = UDim.new(0, 5)
-    togglePadding.Parent = toggleFrame
+        return frame
+    end
 
     local function makeButton(parent, labelText, color, callback)
         local btn = Instance.new("TextButton")
@@ -766,6 +821,9 @@ else
         btn.MouseButton1Click:Connect(callback)
         return btn
     end
+
+    local frame = makePanel(screenGui, -60)
+    local toggleFrame = makePanel(screenGui, -110)
 
     local espBtn = makeButton(frame, "[ESP] ON", Color3.fromRGB(0, 170, 80), function()
         local on = toggleESP()
